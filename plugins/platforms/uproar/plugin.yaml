@@ -1,0 +1,51 @@
+name: uproar-platform
+label: Uproar
+kind: platform
+version: 1.0.0
+description: >
+  Uproar (uproar.chat) gateway adapter for Hermes Agent.
+  Connects an Uproar agent to Hermes over the dial-out WebSocket at
+  /api/bots/{id}/stream, so no public URL or webhook receiver is needed,
+  and acts through the bot execute endpoint. Supports DMs and server
+  channels, mention gating, reply threading, native file uploads,
+  streaming edits, and home-channel cron delivery. No external
+  dependencies beyond aiohttp, which Hermes already requires.
+author: NousResearch
+requires_env:
+  - name: UPROAR_BOT_ID
+    description: "Agent (bot) ID, the BOT_ID in the create response URL"
+    prompt: "Uproar bot ID"
+    password: false
+  - name: UPROAR_TOKEN
+    description: "Agent execute token, shown once when the agent is created or regenerated"
+    prompt: "Uproar bot token"
+    password: true
+optional_env:
+  - name: UPROAR_URL
+    description: "Uproar server URL (default: https://uproar.chat)"
+    prompt: "Uproar server URL"
+    password: false
+  - name: UPROAR_ALLOWED_USERS
+    description: "Comma-separated Uproar user IDs allowed to talk to the agent"
+    prompt: "Allowed user IDs (comma-separated)"
+    password: false
+  - name: UPROAR_ALLOW_ALL_USERS
+    description: "Allow any Uproar user to trigger the agent (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: UPROAR_HOME_CHANNEL
+    description: "Default channel ID for cron / notification delivery"
+    prompt: "Home channel ID"
+    password: false
+  - name: UPROAR_REQUIRE_MENTION
+    description: "Require an @mention in server channels (default true). DMs never require one."
+    prompt: "Require @mention? (true/false)"
+    password: false
+  - name: UPROAR_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated channel IDs where an @mention is not required"
+    prompt: "Free-response channel IDs (comma-separated)"
+    password: false
+  - name: UPROAR_ALLOWED_CHANNELS
+    description: "If set, the agent only responds in these channel IDs (whitelist)"
+    prompt: "Allowed channel IDs (comma-separated)"
+    password: false

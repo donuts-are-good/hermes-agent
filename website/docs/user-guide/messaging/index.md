@@ -46,6 +46,7 @@ Bots need both a model provider and tool providers (TTS, web). A [Nous Portal](/
 | IRC | — | — | — | — | — | — | — |
 | Buzz | — | ✅ | — | ✅ | — | — | — |
 | SimpleX | ✅ | ✅ | ✅ | — | — | ✅ | — |
+| Uproar | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ |
 
 **Voice** = TTS audio replies and/or voice message transcription. **Images** = send/receive images. **Files** = send/receive file attachments. **Threads** = threaded conversations. **Reactions** = emoji reactions on messages. **Typing** = typing indicator while processing. **Streaming** = progressive message updates via editing.
 
