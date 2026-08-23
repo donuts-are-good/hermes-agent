@@ -69,6 +69,11 @@ _SUBSCRIBE_EVENTS = [
 
 _UPLOAD_MAX_FILES = 4
 
+_EMBED_METADATA_KEY = "uproar_embed"
+_EMBED_DESCRIPTION_LIMIT = 4000
+_COLOR_ASK = 0x5865F2
+_COLOR_WARN = 0xFAA61A
+
 _RETRY_429_ATTEMPTS = 2
 _RETRY_429_DEFAULT_DELAY = 5.0
 _RETRY_429_MAX_DELAY = 60.0
@@ -384,6 +389,16 @@ class UproarAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         chat_id = self._dm_target_cache.get(chat_id, chat_id)
+
+        embed = self._embed_from_metadata(content, metadata)
+        if embed is not None:
+            data = await self._execute(
+                "send", channel_id=chat_id, embeds=[embed], reply_to=reply_to
+            )
+            if not data or "id" not in data:
+                return SendResult(success=False, error="Failed to send message")
+            return SendResult(success=True, message_id=data["id"])
+
         chunks = self.truncate_message(self.format_message(content), MAX_MESSAGE_LENGTH)
 
         last_id = None
@@ -413,6 +428,63 @@ class UproarAdapter(BasePlatformAdapter):
             last_id = data["id"]
 
         return SendResult(success=True, message_id=last_id)
+
+    @staticmethod
+    def _embed_from_metadata(
+        content: str, metadata: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Build an embed for a prompt that asked to be rendered as one.
+
+        Uproar has no buttons, so an interactive prompt still resolves by the
+        user typing a reply. The embed only makes it visually distinct from
+        ordinary chat, which is what the button-capable adapters get from
+        their own embeds.
+        """
+        spec = (metadata or {}).get(_EMBED_METADATA_KEY)
+        if not isinstance(spec, dict):
+            return None
+        body = content or ""
+        if len(body) > _EMBED_DESCRIPTION_LIMIT:
+            body = body[: _EMBED_DESCRIPTION_LIMIT - 1] + "\u2026"
+        embed: Dict[str, Any] = {"description": body}
+        title = spec.get("title")
+        if title:
+            embed["title"] = str(title)[:256]
+        color = spec.get("color")
+        if isinstance(color, int) and 0 <= color <= 16777215:
+            embed["color"] = color
+        return embed
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render the clarify prompt as an embed, keeping the text fallback.
+
+        The base builds the numbered list and registers the text intercept, so
+        this only asks for the embed treatment and delegates the rest.
+        """
+        return await super().send_clarify(
+            chat_id,
+            question,
+            choices,
+            clarify_id,
+            session_key,
+            metadata=self._with_embed(metadata, "Hermes needs your input", _COLOR_ASK),
+        )
+
+    @staticmethod
+    def _with_embed(
+        metadata: Optional[Dict[str, Any]], title: str, color: int
+    ) -> Dict[str, Any]:
+        merged = dict(metadata or {})
+        merged[_EMBED_METADATA_KEY] = {"title": title, "color": color}
+        return merged
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return the channel's name and type, cached per channel."""

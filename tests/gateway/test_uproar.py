@@ -1123,3 +1123,54 @@ class TestDmTargetResolution:
         a._execute = _exec
         result = await a.send(ADA_USER, "hi")
         assert result.success is False
+
+
+@pytest.mark.asyncio
+class TestEmbedPrompts:
+    """Uproar has no buttons, but it does have embeds. Use them."""
+
+    async def test_clarify_renders_as_an_embed_and_keeps_the_text(self):
+        a = _adapter()
+        sent = []
+
+        async def _exec(action, **kw):
+            sent.append(kw)
+            return {"id": "m1"}
+
+        a._execute = _exec
+        with patch("tools.clarify_gateway.mark_awaiting_text") as mark:
+            await a.send_clarify("ch_1", "Which one?", ["alpha", "beta"], "cid", "sk")
+
+        assert mark.called, "the text intercept must still be registered"
+        embeds = sent[0]["embeds"]
+        assert len(embeds) == 1
+        assert embeds[0]["title"] == "Hermes needs your input"
+        assert "alpha" in embeds[0]["description"]
+        assert "1." in embeds[0]["description"]
+        assert "content" not in sent[0]
+
+    async def test_a_normal_send_is_not_an_embed(self):
+        a = _adapter()
+        sent = []
+
+        async def _exec(action, **kw):
+            sent.append(kw)
+            return {"id": "m1"}
+
+        a._execute = _exec
+        await a.send("ch_1", "just a message")
+        assert "embeds" not in sent[0]
+        assert sent[0]["content"] == "just a message"
+
+    async def test_an_oversized_description_is_trimmed(self):
+        a = _adapter()
+        embed = a._embed_from_metadata("z" * 9000, {"uproar_embed": {"title": "T"}})
+        assert len(embed["description"]) <= uproar._EMBED_DESCRIPTION_LIMIT
+
+    async def test_colour_stays_in_uproar_range(self):
+        """Uproar rejects a color outside 0..16777215."""
+        a = _adapter()
+        ok = a._embed_from_metadata("x", {"uproar_embed": {"color": 0x5865F2}})
+        assert 0 <= ok["color"] <= 16777215
+        bad = a._embed_from_metadata("x", {"uproar_embed": {"color": 99999999}})
+        assert "color" not in bad
