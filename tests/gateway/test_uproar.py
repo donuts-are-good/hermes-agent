@@ -914,3 +914,212 @@ class TestReactionAcks:
             ("unreact", a._ACK_EMOJI),
             ("react", a._FAIL_EMOJI),
         ]
+
+
+@pytest.mark.asyncio
+class TestReactionEvents:
+    """Slack forwards reactions to the hook surface; match that."""
+
+    async def test_reaction_add_reaches_the_hook(self):
+        a = _adapter()
+        seen = []
+        a.set_reaction_handler(lambda e: seen.append(e) or asyncio_sleep())
+        await a._handle_frame({
+            "type": "reaction_add",
+            "data": {
+                "message_id": "msg_1", "channel_id": "ch_1",
+                "user_id": ADA_USER, "emoji": "\U0001f44d",
+                "message": {"user_id": BOT_USER},
+            },
+        })
+        assert len(seen) == 1
+        e = seen[0]
+        assert e["platform"] == "uproar"
+        assert e["event_name"] == "reaction:added"
+        assert e["reaction"] == "\U0001f44d"
+        assert e["user_id"] == ADA_USER
+        assert e["item_user_id"] == BOT_USER
+        assert e["channel_id"] == "ch_1"
+        assert e["message_ts"] == "msg_1"
+
+    async def test_reaction_remove_names_the_right_event(self):
+        a = _adapter()
+        seen = []
+        a.set_reaction_handler(lambda e: seen.append(e) or asyncio_sleep())
+        await a._handle_frame({
+            "type": "reaction_remove",
+            "data": {"message_id": "m", "channel_id": "c", "user_id": ADA_USER, "emoji": "x"},
+        })
+        assert seen[0]["event_name"] == "reaction:removed"
+
+    async def test_own_reactions_do_not_echo(self):
+        """The adapter adds ack reactions; those must not fire the hook."""
+        a = _adapter()
+        seen = []
+        a.set_reaction_handler(lambda e: seen.append(e) or asyncio_sleep())
+        await a._handle_frame({
+            "type": "reaction_add",
+            "data": {"message_id": "m", "channel_id": "c", "user_id": BOT_USER, "emoji": "\U0001f440"},
+        })
+        assert seen == []
+
+    async def test_no_handler_is_safe(self):
+        a = _adapter()
+        await a._handle_frame({
+            "type": "reaction_add",
+            "data": {"message_id": "m", "channel_id": "c", "user_id": ADA_USER, "emoji": "x"},
+        })
+
+
+async def asyncio_sleep():
+    return None
+
+
+@pytest.mark.asyncio
+class TestMessageChangeEvents:
+    """Discord surfaces edits and deletes; match the envelope."""
+
+    def _wire(self, monkeypatch, subscribed=True):
+        a = _adapter()
+        got = []
+
+        async def _handler(event, source):
+            got.append((event, source))
+
+        a.set_platform_event_handler(_handler)
+        monkeypatch.setattr(
+            a, "_platform_events_subscribed", staticmethod(lambda: subscribed)
+        )
+        return a, got
+
+    async def test_edit_is_normalised(self, monkeypatch):
+        a, got = self._wire(monkeypatch)
+        await a._handle_frame({
+            "type": "message_edit",
+            "data": {
+                "id": "msg_1", "channel_id": "ch_1", "server_id": "srv_1",
+                "user_id": ADA_USER, "content": "fixed typo",
+                "edited_at": "2026-08-22T23:00:00Z", "display_name": "Ada",
+            },
+        })
+        assert len(got) == 1
+        event, source = got[0]
+        assert event["platform"] == "uproar"
+        assert event["event_type"] == "message_edited"
+        assert event["payload"]["text"] == "fixed typo"
+        assert event["payload"]["message_id"] == "msg_1"
+        assert source.chat_id == "ch_1"
+        assert source.scope_id == "srv_1"
+
+    async def test_delete_is_normalised(self, monkeypatch):
+        a, got = self._wire(monkeypatch)
+        await a._handle_frame({
+            "type": "message_delete",
+            "data": {"message_id": "msg_2", "channel_id": "ch_1", "user_id": ADA_USER},
+        })
+        assert got[0][0]["event_type"] == "message_deleted"
+        assert got[0][0]["payload"]["message_id"] == "msg_2"
+
+    async def test_the_agents_own_edits_are_not_events(self, monkeypatch):
+        """Progressive streaming edits are noise, not user activity."""
+        a, got = self._wire(monkeypatch)
+        await a._handle_frame({
+            "type": "message_edit",
+            "data": {"id": "m", "channel_id": "c", "user_id": BOT_USER, "content": "partial"},
+        })
+        assert got == []
+
+    async def test_nothing_fires_without_a_subscriber(self, monkeypatch):
+        a, got = self._wire(monkeypatch, subscribed=False)
+        await a._handle_frame({
+            "type": "message_edit",
+            "data": {"id": "m", "channel_id": "c", "user_id": ADA_USER, "content": "x"},
+        })
+        assert got == []
+
+
+@pytest.mark.asyncio
+class TestDmTargetResolution:
+    """An agent told to DM a user gets a user id, not a channel id."""
+
+    async def test_a_rejected_channel_is_retried_as_a_dm(self):
+        a = _adapter()
+        calls = []
+
+        async def _exec(action, **kw):
+            calls.append((action, kw))
+            if action == "send" and kw.get("channel_id") == ADA_USER:
+                a._last_error = '{"error":"invalid channel"}'
+                return None
+            if action == "open_dm":
+                return {"id": "ch_dm"}
+            return {"id": "m1"}
+
+        a._execute = _exec
+        result = await a.send(ADA_USER, "hello")
+
+        assert result.success is True
+        assert [c[0] for c in calls] == ["send", "open_dm", "send"]
+        assert calls[1][1] == {"target_user_id": ADA_USER}
+        assert calls[2][1]["channel_id"] == "ch_dm"
+
+    async def test_a_normal_channel_costs_no_extra_request(self):
+        """The common path must not probe or open anything."""
+        a = _adapter()
+        a._read = AsyncMock()
+        calls = []
+
+        async def _exec(action, **kw):
+            calls.append(action)
+            return {"id": "m1"}
+
+        a._execute = _exec
+        await a.send("ch_1", "hello")
+
+        assert calls == ["send"]
+        a._read.assert_not_awaited()
+
+    async def test_the_opened_dm_is_reused(self):
+        a = _adapter()
+        opens = []
+
+        async def _exec(action, **kw):
+            if action == "send" and kw.get("channel_id") == ADA_USER:
+                a._last_error = '{"error":"invalid channel"}'
+                return None
+            if action == "open_dm":
+                opens.append(kw)
+                return {"id": "ch_dm"}
+            return {"id": "m1"}
+
+        a._execute = _exec
+        await a.send(ADA_USER, "one")
+        await a.send(ADA_USER, "two")
+        assert len(opens) == 1
+
+    async def test_other_errors_are_not_retried_as_dms(self):
+        a = _adapter()
+        calls = []
+
+        async def _exec(action, **kw):
+            calls.append(action)
+            a._last_error = '{"error":"bot lacks permission to send in this channel"}'
+            return None
+
+        a._execute = _exec
+        result = await a.send("ch_1", "hi")
+        assert result.success is False
+        assert calls == ["send"]
+
+    async def test_a_failed_open_reports_failure(self):
+        a = _adapter()
+
+        async def _exec(action, **kw):
+            if action == "open_dm":
+                return None
+            a._last_error = '{"error":"invalid channel"}'
+            return None
+
+        a._execute = _exec
+        result = await a.send(ADA_USER, "hi")
+        assert result.success is False

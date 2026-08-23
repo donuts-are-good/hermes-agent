@@ -25,7 +25,7 @@ import os
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -161,6 +161,8 @@ class UproarAdapter(BasePlatformAdapter):
         self._cursor_seq: str = ""
 
         self._channel_cache: Dict[str, Dict[str, Any]] = {}
+        self._dm_target_cache: Dict[str, str] = {}
+        self._last_error: str = ""
         self._last_overflow_preview: Dict[str, str] = {}
         self._dedup = MessageDeduplicator()
 
@@ -203,6 +205,7 @@ class UproarAdapter(BasePlatformAdapter):
                         await asyncio.sleep(delay)
                         continue
                     if resp.status >= 400:
+                        self._last_error = body[:200]
                         logger.warning(
                             "Uproar %s → HTTP %s: %s", action, resp.status, body[:200]
                         )
@@ -351,6 +354,24 @@ class UproarAdapter(BasePlatformAdapter):
 
         logger.info("Uproar: disconnected")
 
+    async def _open_dm_with(self, user_id: str) -> Optional[str]:
+        """Open (or fetch) the DM channel with a user, cached.
+
+        Resolution is lazy: a send is tried against the id as given, and only a
+        rejected channel sends us here. Probing every send would double the
+        request count and spend the read budget on the common path, where the
+        id is already a channel.
+        """
+        cached = self._dm_target_cache.get(user_id)
+        if cached:
+            return cached
+        opened = await self._execute("open_dm", target_user_id=user_id)
+        if not opened or "id" not in opened:
+            return None
+        resolved = str(opened["id"])
+        self._dm_target_cache[user_id] = resolved
+        return resolved
+
     async def send(
         self,
         chat_id: str,
@@ -362,6 +383,7 @@ class UproarAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
 
+        chat_id = self._dm_target_cache.get(chat_id, chat_id)
         chunks = self.truncate_message(self.format_message(content), MAX_MESSAGE_LENGTH)
 
         last_id = None
@@ -372,6 +394,20 @@ class UproarAdapter(BasePlatformAdapter):
                 content=chunk,
                 reply_to=reply_to if index == 0 else None,
             )
+            if (
+                not data
+                and index == 0
+                and "invalid channel" in self._last_error.lower()
+            ):
+                opened = await self._open_dm_with(chat_id)
+                if opened:
+                    chat_id = opened
+                    data = await self._execute(
+                        "send",
+                        channel_id=chat_id,
+                        content=chunk,
+                        reply_to=reply_to,
+                    )
             if not data or "id" not in data:
                 return SendResult(success=False, error="Failed to send message")
             last_id = data["id"]
@@ -553,6 +589,7 @@ class UproarAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         return await self._send_local_files(chat_id, [image_path], caption, reply_to)
 
@@ -564,6 +601,7 @@ class UproarAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         return await self._send_local_files(chat_id, [file_path], caption, reply_to)
 
@@ -574,6 +612,7 @@ class UproarAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         return await self._send_local_files(chat_id, [audio_path], caption, reply_to)
 
@@ -584,8 +623,77 @@ class UproarAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> SendResult:
         return await self._send_local_files(chat_id, [video_path], caption, reply_to)
+
+    async def send_animation(
+        self,
+        chat_id: str,
+        animation_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a GIF. Uproar keeps the animation, so upload it as-is."""
+        return await self.send_image(
+            chat_id, animation_url, caption, reply_to, metadata
+        )
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        """Bundle a batch into as few messages as the upload cap allows.
+
+        The default sends one message per image. Uproar takes an attachments
+        array, so a set of images arrives as one message instead of five.
+        """
+        import aiohttp
+
+        from gateway.platforms.base import cache_image_from_bytes
+
+        local: List[str] = []
+        for image_url, _alt in images:
+            path = image_url
+            if path.startswith("file://"):
+                from urllib.parse import unquote, urlparse
+
+                path = unquote(urlparse(path).path)
+            if os.path.exists(path):
+                local.append(path)
+                continue
+            try:
+                async with self._session.get(
+                    image_url, timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status >= 400:
+                        logger.warning(
+                            "Uproar: image fetch %s → HTTP %s",
+                            image_url[:80],
+                            resp.status,
+                        )
+                        continue
+                    blob = await resp.read()
+            except Exception as exc:
+                logger.warning("Uproar: image fetch failed: %s", exc)
+                continue
+            suffix = Path(image_url.split("?")[0]).suffix or ".png"
+            local.append(cache_image_from_bytes(blob, suffix))
+
+        if not local:
+            return
+
+        caption = None
+        for chunk_start in range(0, len(local), _UPLOAD_MAX_FILES):
+            if human_delay > 0 and chunk_start:
+                await asyncio.sleep(human_delay)
+            await self._send_local_files(
+                chat_id, local[chunk_start:chunk_start + _UPLOAD_MAX_FILES], caption, None
+            )
 
     async def _send_local_files(
         self,
@@ -753,10 +861,112 @@ class UproarAdapter(BasePlatformAdapter):
                 )
             return
 
-        if ftype != "message_create" or not isinstance(data, dict):
+        if not isinstance(data, dict):
+            return
+
+        if ftype in ("reaction_add", "reaction_remove"):
+            await self._handle_reaction(ftype, data)
+            return
+
+        if ftype in ("message_edit", "message_delete"):
+            await self._handle_message_change(ftype, data)
+            return
+
+        if ftype != "message_create":
             return
 
         await self._handle_message_create(data)
+
+    @staticmethod
+    def _platform_events_subscribed() -> bool:
+        try:
+            from hermes_cli.lifecycle import has_hook
+
+            return has_hook("gateway_platform_event")
+        except Exception:
+            return False
+
+    async def _handle_message_change(self, ftype: str, data: Dict[str, Any]) -> None:
+        """Normalize an edit or delete onto the gateway platform-event boundary."""
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None or not self._platform_events_subscribed():
+            return
+
+        author = str(data.get("user_id") or "")
+        if self._bot_user_id and author == self._bot_user_id:
+            return
+
+        chat_id = str(data.get("channel_id") or "")
+        message_id = str(data.get("id") or data.get("message_id") or "")
+        if not chat_id or not message_id:
+            return
+
+        deleted = ftype == "message_delete"
+        text = data.get("content")
+        payload = {
+            "chat_id": chat_id[:128],
+            "message_id": message_id[:128],
+            "thread_id": None,
+            "text": text[:8192] if isinstance(text, str) else None,
+        }
+        if not deleted:
+            payload["edited_at"] = str(data.get("edited_at") or "")[:64] or None
+
+        event = {
+            "platform": "uproar",
+            "event_type": "message_deleted" if deleted else "message_edited",
+            "payload": payload,
+        }
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type="channel" if data.get("server_id") else "dm",
+            user_id=author or None,
+            user_name=data.get("display_name") or data.get("username"),
+            scope_id=str(data.get("server_id") or "") or None,
+            message_id=message_id,
+        )
+        try:
+            await handler(event, source)
+        except Exception:
+            logger.debug("Uproar: platform event dispatch error", exc_info=True)
+
+    async def _handle_reaction(self, ftype: str, data: Dict[str, Any]) -> None:
+        """Forward a reaction to the gateway hook surface.
+
+        Mirrors the Slack adapter, so hook consumers see reaction:added and
+        reaction:removed on Uproar too. The agent's own reactions are skipped,
+        otherwise the acknowledgement reactions it adds would echo back.
+        """
+        handler = getattr(self, "_reaction_handler", None)
+        if handler is None:
+            return
+
+        user_id = str(data.get("user_id") or "")
+        if self._bot_user_id and user_id == self._bot_user_id:
+            return
+
+        action = "added" if ftype == "reaction_add" else "removed"
+        message = data.get("message")
+        item_user_id = (
+            message.get("user_id") if isinstance(message, dict) else None
+        )
+        try:
+            await handler(
+                {
+                    "platform": "uproar",
+                    "event_name": f"reaction:{action}",
+                    "reaction": data.get("emoji"),
+                    "user_id": user_id,
+                    "item_user_id": item_user_id,
+                    "item_type": "message",
+                    "channel_id": data.get("channel_id"),
+                    "message_ts": data.get("message_id"),
+                    "event_ts": None,
+                    "raw_event": data,
+                }
+            )
+        except Exception:
+            logger.debug("Uproar: reaction hook forwarding failed", exc_info=True)
 
     async def _handle_message_create(self, msg: Dict[str, Any]) -> None:
         """Turn a message_create payload into a gateway MessageEvent."""
@@ -829,7 +1039,7 @@ class UproarAdapter(BasePlatformAdapter):
             chat_type=chat_type,
             user_id=sender_id,
             user_name=sender_name,
-            guild_id=server_id or None,
+            scope_id=server_id or None,
             message_id=message_id,
             is_bot=bool(msg.get("is_bot")),
         )
