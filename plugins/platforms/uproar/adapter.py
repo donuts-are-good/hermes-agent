@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +69,7 @@ _SUBSCRIBE_EVENTS = [
 ]
 
 _UPLOAD_MAX_FILES = 4
+_CHANNEL_LIST_TTL = 900.0
 
 _EMBED_METADATA_KEY = "uproar_embed"
 _EMBED_DESCRIPTION_LIMIT = 4000
@@ -168,6 +170,8 @@ class UproarAdapter(BasePlatformAdapter):
         self._channel_cache: Dict[str, Dict[str, Any]] = {}
         self._dm_target_cache: Dict[str, str] = {}
         self._last_error: str = ""
+        self._channels_cache: List[Dict[str, Any]] = []
+        self._channels_cached_at: float = 0.0
         self._last_overflow_preview: Dict[str, str] = {}
         self._dedup = MessageDeduplicator()
 
@@ -485,6 +489,57 @@ class UproarAdapter(BasePlatformAdapter):
         merged = dict(metadata or {})
         merged[_EMBED_METADATA_KEY] = {"title": title, "color": color}
         return merged
+
+    async def list_channels(self) -> List[Dict[str, Any]]:
+        """Enumerate visible channels so targets can be named, not just id'd.
+
+        Without this the channel directory is empty for Uproar and an agent can
+        only send to a raw channel id, while Discord and Slack accept a name.
+
+        The gateway rebuilds the directory every five minutes, and this costs
+        one read per server plus one, so a bot in many servers would spend most
+        of its 60/min read budget on bursts that rediscover the same channels.
+        The result is cached, and a failed read returns the last good list
+        rather than an empty one, which would drop every name target until the
+        next success.
+        """
+        now = time.monotonic()
+        if self._channels_cache and now - self._channels_cached_at < _CHANNEL_LIST_TTL:
+            return self._channels_cache
+
+        servers = await self._read("servers")
+        if not isinstance(servers, list):
+            return self._channels_cache
+
+        out: List[Dict[str, Any]] = []
+        for server in servers:
+            if not isinstance(server, dict) or not server.get("id"):
+                continue
+            channels = await self._read(
+                "channels", {"server_id": str(server["id"])}
+            )
+            if not isinstance(channels, list):
+                continue
+            for channel in channels:
+                if not isinstance(channel, dict) or not channel.get("id"):
+                    continue
+                if channel.get("is_archived"):
+                    continue
+                self._channel_cache.setdefault(str(channel["id"]), channel)
+                out.append(
+                    {
+                        "id": str(channel["id"]),
+                        "name": str(channel.get("name") or channel["id"]),
+                        "type": self._chat_type(channel),
+                        "guild": str(server.get("name") or server["id"]),
+                    }
+                )
+
+        if not out and self._channels_cache:
+            return self._channels_cache
+        self._channels_cache = out
+        self._channels_cached_at = now
+        return out
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return the channel's name and type, cached per channel."""

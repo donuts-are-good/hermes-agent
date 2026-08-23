@@ -1174,3 +1174,116 @@ class TestEmbedPrompts:
         assert 0 <= ok["color"] <= 16777215
         bad = a._embed_from_metadata("x", {"uproar_embed": {"color": 99999999}})
         assert "color" not in bad
+
+
+@pytest.mark.asyncio
+class TestListChannels:
+    """Without this the directory is empty and only raw ids can be targeted."""
+
+    def _reader(self, servers, channels_by_server):
+        async def _read(path, params=None):
+            if path == "servers":
+                return servers
+            if path == "channels":
+                return channels_by_server.get((params or {}).get("server_id"))
+            return None
+        return _read
+
+    async def test_channels_are_listed_across_servers(self):
+        a = _adapter()
+        a._read = self._reader(
+            [{"id": "srv_1", "name": "hermes"}, {"id": "srv_2", "name": "other"}],
+            {
+                "srv_1": [{"id": "ch_1", "name": "general", "server_id": "srv_1"}],
+                "srv_2": [{"id": "ch_2", "name": "random", "server_id": "srv_2"}],
+            },
+        )
+        out = await a.list_channels()
+        assert {c["name"] for c in out} == {"general", "random"}
+        assert {c["guild"] for c in out} == {"hermes", "other"}
+        assert all(c["type"] == "channel" for c in out)
+
+    async def test_archived_channels_are_skipped(self):
+        a = _adapter()
+        a._read = self._reader(
+            [{"id": "srv_1", "name": "hermes"}],
+            {"srv_1": [
+                {"id": "ch_1", "name": "general", "server_id": "srv_1"},
+                {"id": "ch_2", "name": "old", "server_id": "srv_1", "is_archived": True},
+            ]},
+        )
+        assert [c["name"] for c in await a.list_channels()] == ["general"]
+
+    async def test_listing_warms_the_channel_cache(self):
+        """A later get_chat_info must not re-fetch what this already read."""
+        a = _adapter()
+        a._read = self._reader(
+            [{"id": "srv_1", "name": "hermes"}],
+            {"srv_1": [{"id": "ch_1", "name": "general", "server_id": "srv_1"}]},
+        )
+        await a.list_channels()
+        assert "ch_1" in a._channel_cache
+
+        a._read = AsyncMock()
+        info = await a.get_chat_info("ch_1")
+        assert info["name"] == "general"
+        a._read.assert_not_awaited()
+
+    async def test_no_servers_is_not_an_error(self):
+        a = _adapter()
+        a._read = AsyncMock(return_value=None)
+        assert await a.list_channels() == []
+
+    async def test_the_list_is_cached_between_rebuilds(self):
+        """The gateway rebuilds every 5 minutes; each rebuild costs 1+N reads."""
+        a = _adapter()
+        reads = []
+
+        async def _read(path, params=None):
+            reads.append(path)
+            if path == "servers":
+                return [{"id": "srv_1", "name": "hermes"}]
+            return [{"id": "ch_1", "name": "general", "server_id": "srv_1"}]
+
+        a._read = _read
+        first = await a.list_channels()
+        second = await a.list_channels()
+
+        assert first == second
+        assert reads == ["servers", "channels"], "second call must not re-read"
+
+    async def test_a_failed_read_keeps_the_last_good_list(self):
+        """Returning [] would drop every name target until the next success."""
+        a = _adapter()
+
+        async def _ok(path, params=None):
+            if path == "servers":
+                return [{"id": "srv_1", "name": "hermes"}]
+            return [{"id": "ch_1", "name": "general", "server_id": "srv_1"}]
+
+        a._read = _ok
+        good = await a.list_channels()
+        assert len(good) == 1
+
+        a._channels_cached_at = 0.0
+        a._read = AsyncMock(return_value=None)
+        assert await a.list_channels() == good
+
+    async def test_an_empty_result_does_not_wipe_the_cache(self):
+        a = _adapter()
+
+        async def _ok(path, params=None):
+            if path == "servers":
+                return [{"id": "srv_1", "name": "hermes"}]
+            return [{"id": "ch_1", "name": "general", "server_id": "srv_1"}]
+
+        a._read = _ok
+        good = await a.list_channels()
+
+        a._channels_cached_at = 0.0
+
+        async def _empty(path, params=None):
+            return []
+
+        a._read = _empty
+        assert await a.list_channels() == good
