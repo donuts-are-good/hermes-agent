@@ -197,6 +197,7 @@ class UproarAdapter(BasePlatformAdapter):
 
         payload = {"action": action}
         payload.update({k: v for k, v in fields.items() if v is not None})
+        self._last_error = ""
 
         for attempt in range(_RETRY_429_ATTEMPTS + 1):
             try:
@@ -814,12 +815,11 @@ class UproarAdapter(BasePlatformAdapter):
         if not local:
             return
 
-        caption = None
         for chunk_start in range(0, len(local), _UPLOAD_MAX_FILES):
             if human_delay > 0 and chunk_start:
                 await asyncio.sleep(human_delay)
             await self._send_local_files(
-                chat_id, local[chunk_start:chunk_start + _UPLOAD_MAX_FILES], caption, None
+                chat_id, local[chunk_start:chunk_start + _UPLOAD_MAX_FILES], None, None
             )
 
     async def _send_local_files(

@@ -1287,3 +1287,27 @@ class TestListChannels:
 
         a._read = _empty
         assert await a.list_channels() == good
+
+
+@pytest.mark.asyncio
+class TestStaleErrorState:
+    async def test_a_network_failure_does_not_inherit_an_old_error(self):
+        """A stale 'invalid channel' would trigger a bogus open_dm on the next send."""
+        a = _adapter()
+        a._last_error = '{"error":"invalid channel"}'
+        calls = []
+
+        async def _exec_real(action, **kw):
+            calls.append(action)
+            return None
+
+        a._session = _FakeSession([_FakeResp(500, "boom")])
+        assert await a._execute("send", channel_id="ch_1", content="x") is None
+        assert "invalid channel" not in a._last_error
+
+    async def test_a_success_clears_the_previous_error(self):
+        a = _adapter()
+        a._last_error = '{"error":"invalid channel"}'
+        a._session = _FakeSession([_FakeResp(201, '{"id":"m1"}')])
+        await a._execute("send", channel_id="ch_1", content="x")
+        assert a._last_error == ""
